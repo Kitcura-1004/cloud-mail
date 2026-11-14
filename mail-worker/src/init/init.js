@@ -1,6 +1,7 @@
 import settingService from '../service/setting-service';
 import emailUtils from '../utils/email-utils';
-import {emailConst} from "../const/entity-const";
+import saltHashUtils from '../utils/crypto-utils';
+import {emailConst, settingConst} from "../const/entity-const";
 
 const dbInit = {
 	async init(c) {
@@ -34,8 +35,70 @@ const dbInit = {
 		await this.v3_3DB(c);
 		await this.v3_4DB(c);
 		await this.v3_5DB(c);
+		const adminError = await this.prepareClosedLaunch(c);
+		if (adminError) {
+			return c.text(adminError);
+		}
 		await settingService.refresh(c);
 		return c.text('success');
+	},
+
+	async prepareClosedLaunch(c) {
+		await c.env.db.prepare(`
+			UPDATE setting SET register = ?
+			WHERE register = ?
+			AND NOT EXISTS (SELECT 1 FROM user WHERE is_del = 0)
+		`).bind(settingConst.register.CLOSE, settingConst.register.OPEN).run();
+
+		const email = typeof c.env.admin === 'string' ? c.env.admin.trim() : '';
+		if (!email || !emailUtils.getDomain(email)) {
+			return 'admin binding missing';
+		}
+
+		let domains = c.env.domain;
+		if (typeof domains === 'string') {
+			try {
+				domains = JSON.parse(domains);
+			} catch (e) {
+				return 'domain binding is not json';
+			}
+		}
+		if (!Array.isArray(domains) || !domains.includes(emailUtils.getDomain(email))) {
+			return 'admin domain mismatch';
+		}
+
+		const existing = await c.env.db.prepare(
+			`SELECT user_id, email FROM user WHERE email = ? COLLATE NOCASE AND is_del = 0`
+		).bind(email).first();
+
+		if (existing) {
+			if (existing.email !== email) {
+				return 'admin email case mismatch';
+			}
+			return null;
+		}
+
+		const password = c.env.admin_password;
+		if (typeof password !== 'string' || password.length < 6 || password.length > 30) {
+			return 'admin not provisioned';
+		}
+
+		const { salt, hash } = await saltHashUtils.hashPassword(password);
+		await c.env.db.prepare(`
+			INSERT INTO user (email, type, password, salt, status, is_del, reg_key_id, send_count, sort)
+			VALUES (?, 1, ?, ?, 0, 0, 0, 0, 0)
+		`).bind(email, hash, salt).run();
+
+		const created = await c.env.db.prepare(
+			`SELECT user_id FROM user WHERE email = ?`
+		).bind(email).first();
+
+		await c.env.db.prepare(`
+			INSERT INTO account (email, name, user_id, status, is_del, all_receive, sort)
+			VALUES (?, ?, ?, 0, 0, 0, 0)
+		`).bind(email, emailUtils.getName(email), created.user_id).run();
+
+		return null;
 	},
 
 	async v3_5DB(c) {
@@ -701,7 +764,7 @@ const dbInit = {
 			  INSERT INTO setting (
 				register, receive, add_email, many_email, title, auto_refresh, register_verify, add_email_verify
 			  )
-			  SELECT 0, 0, 0, 0, 'Cloud Mail', 0, 1, 1
+			  SELECT 1, 0, 0, 0, 'Cloud Mail', 0, 1, 1
 			  WHERE NOT EXISTS (SELECT 1 FROM setting)
 			`).run();
 		} catch (e) {
