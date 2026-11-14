@@ -24,5 +24,7 @@ dist
 mail-vue/node_modules
 mail-vue/dist
 .wrangler
+admin-password.secret.json
+mail-worker/.init-bundle
 .venv
 git-tools.js
