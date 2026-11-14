@@ -67,13 +67,35 @@ const dbInit = {
 			return 'admin domain mismatch';
 		}
 
-		const existing = await c.env.db.prepare(
-			`SELECT user_id, email FROM user WHERE email = ? COLLATE NOCASE AND is_del = 0`
-		).bind(email).first();
+		const userResult = await c.env.db.prepare(
+			`SELECT user_id, email, is_del FROM user WHERE email = ? COLLATE NOCASE`
+		).bind(email).all();
+		const userRows = userResult.results || [];
+		if (userRows.length > 1) {
+			return 'admin email ambiguous';
+		}
+		const userRow = userRows[0];
+		if (userRow && userRow.email !== email) {
+			return 'admin email case mismatch';
+		}
 
-		if (existing) {
-			if (existing.email !== email) {
-				return 'admin email case mismatch';
+		const accountResult = await c.env.db.prepare(
+			`SELECT account_id, user_id, is_del FROM account WHERE email = ? COLLATE NOCASE`
+		).bind(email).all();
+		const accountRows = accountResult.results || [];
+		if (accountRows.length > 1) {
+			return 'admin mailbox occupied';
+		}
+		const accountRow = accountRows[0];
+		if (accountRow && (!userRow || Number(accountRow.user_id) !== Number(userRow.user_id))) {
+			return 'admin mailbox occupied';
+		}
+
+		if (userRow && Number(userRow.is_del) === 0) {
+			if (!accountRow) {
+				await this.insertAdminAccount(c, email, userRow.user_id);
+			} else if (Number(accountRow.is_del) !== 0) {
+				await this.restoreAdminAccount(c, email, accountRow.account_id, userRow.user_id);
 			}
 			return null;
 		}
@@ -82,23 +104,53 @@ const dbInit = {
 		if (typeof password !== 'string' || password.length < 6 || password.length > 30) {
 			return 'admin not provisioned';
 		}
-
 		const { salt, hash } = await saltHashUtils.hashPassword(password);
-		await c.env.db.prepare(`
-			INSERT INTO user (email, type, password, salt, status, is_del, reg_key_id, send_count, sort)
-			VALUES (?, 1, ?, ?, 0, 0, 0, 0, 0)
-		`).bind(email, hash, salt).run();
 
-		const created = await c.env.db.prepare(
-			`SELECT user_id FROM user WHERE email = ?`
-		).bind(email).first();
+		let userId = userRow?.user_id;
+		if (userRow) {
+			await c.env.db.prepare(`
+				UPDATE user
+				SET email = ?, password = ?, salt = ?, status = 0, is_del = 0
+				WHERE user_id = ?
+			`).bind(email, hash, salt, userId).run();
+		} else {
+			const inserted = await c.env.db.prepare(`
+				INSERT INTO user (email, type, password, salt, status, is_del, reg_key_id, send_count, sort)
+				VALUES (?, 1, ?, ?, 0, 0, 0, 0, 0)
+			`).bind(email, hash, salt).run();
+			userId = inserted.meta?.last_row_id;
+			if (!userId) {
+				const created = await c.env.db.prepare(
+					`SELECT user_id FROM user WHERE email = ? AND is_del = 0`
+				).bind(email).first();
+				userId = created?.user_id;
+			}
+		}
 
-		await c.env.db.prepare(`
+		if (!userId) {
+			return 'admin not provisioned';
+		}
+		if (!accountRow) {
+			await this.insertAdminAccount(c, email, userId);
+		} else {
+			await this.restoreAdminAccount(c, email, accountRow.account_id, userId);
+		}
+		return null;
+	},
+
+	insertAdminAccount(c, email, userId) {
+		return c.env.db.prepare(`
 			INSERT INTO account (email, name, user_id, status, is_del, all_receive, sort)
 			VALUES (?, ?, ?, 0, 0, 0, 0)
-		`).bind(email, emailUtils.getName(email), created.user_id).run();
+		`).bind(email, emailUtils.getName(email), userId).run();
+	},
 
-		return null;
+	restoreAdminAccount(c, email, accountId, userId) {
+		return c.env.db.prepare(`
+			UPDATE account
+			SET email = ?, name = ?, user_id = ?, status = 0, is_del = 0
+			WHERE account_id = ?
+		`).bind(email, emailUtils.getName(email), userId, accountId).run();
 	},
 
 	async v3_5DB(c) {
